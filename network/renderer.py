@@ -743,7 +743,7 @@ class NeROMaterialRenderer(nn.Module):
         else:
             cam_cen[..., 2] = 0
 
-        Y = torch.zeros([1, 3], device='cpu').expand(pn, 3)
+        Y = torch.zeros([1, 3], device='cpu').expand(pn, 3).clone()
         Y[:, 2] = -1.0
         Z = torch.clone(poses[:, 2, :3])  # pn, 3
         Z[:, 2] = 0
