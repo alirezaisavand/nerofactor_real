@@ -1332,31 +1332,86 @@ class MCShadingNetwork(nn.Module):
 
         return world_dirs, pdf
 
+    def sample_specular_seperate(self, normals, view_dirs, exponent, num_samples):
+        """
+        Sample specular directions according to a Blinn-Phong like distribution.
+        `exponent` is the lobe exponent.
+        """
+        normals = normals / (normals.norm(dim=-1, keepdim=True) + 1e-8)
+        B = normals.shape[0]
+        device = normals.device
+        u1 = torch.rand(B, num_samples, device=device)
+        u2 = torch.rand(B, num_samples, device=device)
+        # Sample half-vectors in local space:
+        # theta_h ~ arccos(u1^(1/(exponent+1))) and phi_h ~ 2*pi*u2.
+        theta_h = torch.acos(torch.clamp(u1, max=1.0) ** (1 / (exponent + 1)))
+        phi_h = 2 * np.pi * u2
+        sin_theta_h = torch.sin(theta_h)
+        cos_theta_h = torch.cos(theta_h)
+        # Half-vectors in local coordinate system:
+        h_local = torch.stack([
+            sin_theta_h * torch.cos(phi_h),
+            sin_theta_h * torch.sin(phi_h),
+            cos_theta_h
+        ], dim=-1)
+        # Transform half-vector to world space:
+        h_world = self.transform_local_to_world(normals, h_local)
+        # Reflect view direction around half-vector:
+        # reflection: ω_i = 2 (v·h) h - v
+        v_dot_h = (view_dirs.unsqueeze(1) * h_world).sum(dim=-1, keepdim=True)
+        spec_dirs = 2 * v_dot_h * h_world - view_dirs.unsqueeze(1)
+        # Compute PDF for half-vector sampling
+        # PDF_h = (exponent + 1) / (2π) * (cosθ_h)^(exponent)
+        pdf_h = (exponent + 1) / (2 * np.pi) * (cos_theta_h ** exponent)
+        # Jacobian for the half-vector to direction mapping:
+        # pdf_spec = pdf_h / (4 * |v · h|)
+        eps = 1e-5  # or a small value that makes sense in your context
+        pdf_spec = pdf_h / (4 * (torch.abs(v_dot_h.squeeze(-1)) + eps))
+        return spec_dirs, pdf_spec
+
+    def sample_diffuse_seperate(self, normals, num_samples):
+        # Cosine-weighted sampling (as before)
+        normals = normals / (normals.norm(dim=-1, keepdim=True) + 1e-8)
+        B = normals.shape[0]
+        device = normals.device
+        u1 = torch.rand(B, num_samples, device=device)
+        u2 = torch.rand(B, num_samples, device=device)
+        r = torch.sqrt(u1)
+        theta = 2 * np.pi * u2
+        x = r * torch.cos(theta)
+        y = r * torch.sin(theta)
+        z = torch.sqrt(torch.clamp(1 - u1, min=0.0))
+        local_dirs = torch.stack([x, y, z], dim=-1)
+        # Transform from local (with +Z aligned with normal) to world space
+        world_dirs = self.transform_local_to_world(normals, local_dirs)
+        pdf_diff = z / np.pi  # cosθ/π
+        return world_dirs, pdf_diff
+
     def shade_mixed(self, pts, normals, view_dirs, reflections, metallic, roughness, albedo, human_poses, is_train):
 
         # sample specular directions
-        # specular_directions, spec_pdfs = self.sample_specular_seperate(normals, view_dirs, 30, self.cfg['specular_sample_num'])
-        specular_directions, spec_pdfs = self.sample_cosine_weighted_rays(normals, self.cfg['specular_sample_num'])
+        specular_directions, spec_pdfs = self.sample_specular_seperate(normals, view_dirs, 50, self.cfg['specular_sample_num'])
+        # specular_directions, spec_pdfs = self.sample_cosine_weighted_rays(normals, self.cfg['specular_sample_num'])
         specular_num = specular_directions.shape[1]
 
         # sample diffuse directions
-        # diffuse_directions, diff_pdfs = self.sample_diffuse_seperate(normals, self.cfg['diffuse_sample_num'])  # [pn,sn0,3]
-        diff_pdfs = spec_pdfs
-        diffuse_directions = specular_directions
+        diffuse_directions, diff_pdfs = self.sample_diffuse_seperate(normals, self.cfg['diffuse_sample_num'])  # [pn,sn0,3]
+        # diff_pdfs = spec_pdfs
+        # diffuse_directions = specular_directions
         point_num, diffuse_num, _ = diffuse_directions.shape
 
         # combine
-        # directions = torch.cat([diffuse_directions, specular_directions], 1)
-        # sn = diffuse_num + specular_num
-        directions = specular_directions
-        sn = specular_num
+        directions = torch.cat([diffuse_directions, specular_directions], 1)
+        sn = diffuse_num + specular_num
+        # directions = specular_directions
+        # sn = specular_num
 
         # specular
         human_poses = human_poses.unsqueeze(1).repeat(1, sn, 1, 1) if human_poses is not None else None
         pts_ = pts.unsqueeze(1).repeat(1, sn, 1)
         lights, hl, light_pts, light_normals, light_pts_mask = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
-        # specular_lights = lights[:, diffuse_num:]
-        specular_lights = lights
+        specular_lights = lights[:, diffuse_num:]
+        # specular_lights = lights
         # Change here for using /nerfactor BRDF model
 
         brdf_prop = self._pred_brdf_at(pts)
@@ -1375,9 +1430,9 @@ class MCShadingNetwork(nn.Module):
 
         cos_theta_spec = torch.clamp(
             (specular_directions * brdf_normals.unsqueeze(1)).sum(dim=-1), min=0.0)  # (B, n_samples)
-        # cos_theta_diff = torch.clamp(
-        #     (diffuse_directions * brdf_normals.unsqueeze(1)).sum(dim=-1), min=0.0)  # (B, n_samples)
-        cos_theta_diff = cos_theta_spec
+        cos_theta_diff = torch.clamp(
+            (diffuse_directions * brdf_normals.unsqueeze(1)).sum(dim=-1), min=0.0)  # (B, n_samples)
+        # cos_theta_diff = cos_theta_spec
 
         cos_theta_spec = cos_theta_spec.unsqueeze(-1)
         cos_theta_diff = cos_theta_diff.unsqueeze(-1)
@@ -1412,8 +1467,8 @@ class MCShadingNetwork(nn.Module):
         specular_colors = torch.mean(spec_brdf * specular_lights * cos_theta_spec / (0.001 + spec_pdfs), 1)
         spec_brdf_avg = torch.mean(spec_brdf, 1)
 
-        # diffuse_lights = lights[:, :diffuse_num]
-        diffuse_lights = lights
+        diffuse_lights = lights[:, :diffuse_num]
+        # diffuse_lights = lights
         #
 
         diffuse_colors = torch.mean(albedo_nerfacor.unsqueeze(1) / np.pi * diffuse_lights * cos_theta_diff / (0.001+diff_pdfs), 1)
