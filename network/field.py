@@ -692,6 +692,16 @@ class MaterialFeatsNetwork(nn.Module):
 def saturate_dot(v0,v1):
     return torch.clamp(torch.sum(v0*v1,dim=-1,keepdim=True),min=0.0,max=1.0)
 
+from nerfactor.third_party.xiuminglib import xiuminglib as xm
+from nerfactor.nerfactor.models.brdf import Model as BRDFModel
+# from nerfactor.nerfactor.networks.embedder import Embedder as nerfactor_Embedder
+from nerfactor.nerfactor.util import config as configutil, \
+    io as ioutil
+
+from utils import geom as geomutil
+from network.embedder import Embedder as nerfactor_Embedder
+
+
 class MCShadingNetwork(nn.Module):
     default_cfg={
         'diffuse_sample_num': 512,
