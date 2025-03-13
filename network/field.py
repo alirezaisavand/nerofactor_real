@@ -1257,6 +1257,81 @@ class MCShadingNetwork(nn.Module):
     #     outputs['specular_color'] = specular_colors
     #     outputs['approximate_light'] = torch.clamp(linear_to_srgb(torch.mean(kd[:,:diffuse_num] * diffuse_lights, dim=1)+specular_colors),min=0,max=1)
     #     return colors, outputs
+    def sample_cosine_weighted_rays(self, normals, num_samples=1):
+        """
+        Samples cosine-weighted ray directions for a batch of points.
+
+        Parameters:
+            normals (torch.Tensor): A tensor of shape (B, 3) containing surface normals (assumed normalized).
+            num_samples (int): The number of ray samples per point.
+
+        Returns:
+            world_dirs (torch.Tensor): A tensor of shape (B, num_samples, 3) containing the sampled ray directions in world space.
+            pdf (torch.Tensor): A tensor of shape (B, num_samples) containing the probability density function values for each sample.
+                               For cosine-weighted sampling, pdf = cos(theta) / pi.
+        """
+        B = normals.shape[0]
+        device = normals.device
+
+        # Ensure normals are normalized
+        normals = normals / (normals.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # Sample two independent uniform random variables for each ray sample: shape (B, num_samples)
+        u1 = torch.rand(B, num_samples, device=device)
+        u2 = torch.rand(B, num_samples, device=device)
+
+        # Convert uniform random numbers to polar coordinates for cosine-weighted sampling.
+        # The radial distance r = sqrt(u1) ensures cosine weighting.
+        r = torch.sqrt(u1)
+        theta = 2 * np.pi * u2
+
+        # Local (tangent-space) coordinates: x, y, z.
+        # Here, z = sqrt(1 - u1) so that the distribution is cosine-weighted.
+        x = r * torch.cos(theta)
+        y = r * torch.sin(theta)
+        z = torch.sqrt(torch.clamp(1.0 - u1, min=0.0))
+
+        # Stack to create local direction vectors of shape (B, num_samples, 3)
+        local_dirs = torch.stack([x, y, z], dim=-1)
+
+        # --- Build an Orthonormal Basis for Each Normal (Tangent Space) ---
+        # For each normal we choose an "up" vector. A common strategy is:
+        # if |normal_z| < 0.999, use up = [0, 0, 1], otherwise use up = [1, 0, 0].
+        up = torch.empty_like(normals)
+        # Create a mask for normals that are not nearly vertical.
+        mask = (normals[:, 2].abs() < 0.999)
+        up[mask] = torch.tensor([0.0, 0.0, 1.0], device=device)
+        up[~mask] = torch.tensor([1.0, 0.0, 0.0], device=device)
+
+        # Compute tangent = normalize(cross(up, normal))
+        tangent = torch.cross(up, normals, dim=-1)
+        tangent = tangent / (tangent.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # Compute bitangent = cross(normal, tangent)
+        bitangent = torch.cross(normals, tangent, dim=-1)
+        bitangent = bitangent / (bitangent.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # Expand tangent space vectors to shape (B, 1, 3) for broadcasting.
+        tangent = tangent.unsqueeze(1)  # Shape: (B, 1, 3)
+        bitangent = bitangent.unsqueeze(1)  # Shape: (B, 1, 3)
+        normals_exp = normals.unsqueeze(1)  # Shape: (B, 1, 3)
+
+        # Transform local directions to world space:
+        # world_dir = local_x * tangent + local_y * bitangent + local_z * normal.
+        world_dirs = (local_dirs[..., 0:1] * tangent +
+                      local_dirs[..., 1:2] * bitangent +
+                      local_dirs[..., 2:3] * normals_exp)
+
+        # Normalize the resulting world directions (optional but often good to do)
+        world_dirs = world_dirs / (world_dirs.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # Compute PDF for each sample:
+        # For cosine-weighted sampling, pdf = cos(theta) / pi.
+        # In the local coordinate system, cos(theta) is the z component.
+        pdf = local_dirs[..., 2] / np.pi  # Shape: (B, num_samples)
+
+        return world_dirs, pdf
+
     def shade_mixed(self, pts, normals, view_dirs, reflections, metallic, roughness, albedo, human_poses, is_train):
 
         # sample specular directions
@@ -1425,8 +1500,16 @@ class MCShadingNetwork(nn.Module):
                 change = (torch.cos(ang) * x + torch.sin(ang) * y) * eps
             else:
                 raise NotImplementedError
-            m0, r0, a0 = self.predict_materials(pts+change)
-            reg = reg + torch.mean((torch.abs(m0-metallic) + torch.abs(r0-roughness) + torch.abs(a0 - albedo)) * self.cfg['reg_lambda1'], dim=1)
+            m0, r0, a0 = self.predict_materials(pts + change)
+
+            brdf_prop_jitter = self._pred_brdf_at(pts + change)
+            brdf_prop_pred = self._pred_brdf_at(pts)
+            brdf_smooth_loss = self.nerfactor_smooth_loss(brdf_prop_pred, brdf_prop_jitter)  # N
+            # todo modify nerfactor_brdf_smooth_weight based on loss function
+            reg += self.nerfactor_brdf_smooth_weight * brdf_smooth_loss
+
+            reg = reg + torch.mean(
+                torch.abs(a0 - albedo) * self.nerfactor_albedo_smooth_weight, dim=1)
 
         if self.cfg['reg_min_max'] and step is not None and step < 2000:
             # sometimes the roughness and metallic saturate with the sigmoid activation in the early stage

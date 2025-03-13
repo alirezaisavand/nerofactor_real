@@ -29,9 +29,12 @@ def get_key_images(data_pr, keys, h, w):
     return results
 
 def draw_materials(data_pr, h, w):
-    keys=['diffuse_albedo', 'diffuse_light', 'diffuse_color',
-          'specular_albedo', 'specular_light', 'specular_color', 'specular_ref',
-          'metallic', 'roughness', 'occ_prob', 'indirect_light']
+    # keys=['diffuse_albedo', 'diffuse_light', 'diffuse_color',
+    #       'specular_albedo', 'specular_light', 'specular_color', 'specular_ref',
+    #       'metallic', 'roughness', 'occ_prob', 'indirect_light']
+    keys = ['diffuse_albedo', 'diffuse_light', 'diffuse_color',
+            'specular_albedo', 'specular_light', 'specular_color', 'specular_ref',
+            'occ_prob', 'indirect_light', 'spec_brdf']
     results = get_key_images(data_pr, keys, h, w)
     results = [concat_images_list(*results[0:3]),concat_images_list(*results[3:7]),concat_images_list(*results[7:])]
     return results
@@ -85,7 +88,9 @@ class MaterialRenderMetrics(Loss):
         ssim = structural_similarity(rgb_gt, rgb_pr, win_size=11, channel_axis=2, data_range=255)
         outputs={'psnr': np.asarray([psnr]),'ssim': np.asarray([ssim])}
 
-        additional_keys = ['albedo', 'metallic', 'roughness', 'specular_light', 'specular_color', 'diffuse_light', 'diffuse_color']
+        # additional_keys = ['albedo', 'metallic', 'roughness', 'specular_light', 'specular_color', 'diffuse_light', 'diffuse_color']
+        additional_keys = ['albedo', 'specular_light', 'specular_color', 'diffuse_light',
+                           'diffuse_color', 'spec_brdf']
         for k in additional_keys:
             img = color_map_backward(data_pr[k].detach().cpu().numpy())
             if img.shape[-1] == 1: img = np.repeat(img, 3, axis=-1)
