@@ -376,7 +376,7 @@ def IPE(mean,var,min_deg,max_deg):
     shape = mean.shape[:-1] + (-1,)
     scaled_mean = torch.reshape(mean[..., None, :] * scales[:, None], shape)
     scaled_var = torch.reshape(var[..., None, :] * scales[:, None]**2, shape)
-    return expected_sin(torch.cat([scaled_mean, scaled_mean + 0.5 * np.pi], dim=-1), torch.concat([scaled_var] * 2, dim=-1))
+    return expected_sin(torch.cat([scaled_mean, scaled_mean + 0.5 * np.pi], dim=-1), torch.cat([scaled_var] * 2, dim=-1))
 
 def offset_points_to_sphere(points):
     points_norm = torch.norm(points, dim=-1)
