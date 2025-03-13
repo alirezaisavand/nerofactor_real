@@ -1511,12 +1511,12 @@ class MCShadingNetwork(nn.Module):
             reg = reg + torch.mean(
                 torch.abs(a0 - albedo) * self.nerfactor_albedo_smooth_weight, dim=1)
 
-        if self.cfg['reg_min_max'] and step is not None and step < 2000:
-            # sometimes the roughness and metallic saturate with the sigmoid activation in the early stage
-            reg = reg + torch.sum(torch.clamp(roughness - 0.98**2, min=0))
-            reg = reg + torch.sum(torch.clamp(0.02**2 - roughness, min=0))
-            reg = reg + torch.sum(torch.clamp(metallic - 0.98, min=0))
-            reg = reg + torch.sum(torch.clamp(0.02 - metallic, min=0))
+        # if self.cfg['reg_min_max'] and step is not None and step < 2000:
+        #     # sometimes the roughness and metallic saturate with the sigmoid activation in the early stage
+        #     reg = reg + torch.sum(torch.clamp(roughness - 0.98**2, min=0))
+        #     reg = reg + torch.sum(torch.clamp(0.02**2 - roughness, min=0))
+        #     reg = reg + torch.sum(torch.clamp(metallic - 0.98, min=0))
+        #     reg = reg + torch.sum(torch.clamp(0.02 - metallic, min=0))
 
         return reg
 
