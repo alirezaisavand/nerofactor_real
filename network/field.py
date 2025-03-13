@@ -8,7 +8,8 @@ import mcubes
 from utils.base_utils import az_el_to_points, sample_sphere
 from utils.raw_utils import linear_to_srgb
 from utils.ref_utils import generate_ide_fn
-
+from utils import math as mathutil
+import tensorflow as tf
 
 # Positional encoding embedding. Code was taken from https://github.com/bmild/nerf.
 class Embedder:
@@ -714,6 +715,48 @@ class MCShadingNetwork(nn.Module):
         self.cfg={**self.default_cfg, **cfg}
         super().__init__()
 
+        config_ini = "nerfactor/nerfactor/config/nerfactor.ini"
+        config = ioutil.read_config(config_ini)
+        self.nerfactor_config = config
+        brdf_ckpt = config.get('DEFAULT', 'brdf_model_ckpt')
+        brdf_config_path = configutil.get_config_ini(brdf_ckpt)
+        print(brdf_config_path)
+        self.nerfactor_config_brdf = ioutil.read_config(brdf_config_path)
+        self.nerfactor_pred_brdf = config.getboolean('DEFAULT', 'pred_brdf')
+        self.nerfactor_z_dim = self.nerfactor_config_brdf.getint('DEFAULT', 'z_dim')
+        self.nerfactor_normalize_brdf_z = self.nerfactor_config_brdf.getboolean(
+            'DEFAULT', 'normalize_z')
+
+        # Pre-trained BRDF Decoder
+        self.nerfactor_albedo_smooth_weight = config.getfloat(
+            'DEFAULT', 'albedo_smooth_weight')
+        self.nerfactor_brdf_smooth_weight = config.getfloat(
+            'DEFAULT', 'brdf_smooth_weight')
+        self.nerfactor_brdf_model = BRDFModel(self.nerfactor_config_brdf)
+        ioutil.restore_model(self.nerfactor_brdf_model, brdf_ckpt)
+        self.nerfactor_brdf_model.trainable = False
+        self.nerfactor_brdf_smooth_weight = config.getfloat(
+            'DEFAULT', 'brdf_smooth_weight')
+
+        # BRDF Encoder
+        mlp_width = config.getint('DEFAULT', 'mlp_width')
+        mlp_depth = config.getint('DEFAULT', 'mlp_depth')
+        mlp_skip_at = config.getint('DEFAULT', 'mlp_skip_at')
+        self.nerfactor_net = {}
+        # BRDF Z
+        from network.mlp_brdf import MLPNetwork as brdf_mlp
+        self.nerfactor_embedder = self._init_nerfactor_embedder()
+        self.nerfactor_net['brdf_z_mlp'] = brdf_mlp(
+            [self.nerfactor_embedder['xyz'].out_dims] + [mlp_width] * mlp_depth, act=['relu'] * mlp_depth,
+            skip_at=[mlp_skip_at])
+        self.nerfactor_net['brdf_z_out'] = brdf_mlp([mlp_width, self.nerfactor_z_dim], act=None)
+        # setting up the nerfactor embedder
+
+        self.nerfactor_xyz_scale = self.nerfactor_config.getfloat(
+            'DEFAULT', 'xyz_scale', fallback=1.)
+        self.nerfactor_smooth_use_l1 = self.nerfactor_config.getboolean('DEFAULT', 'smooth_use_l1')
+        self.nerfactor_smooth_loss = nn.L1Loss() if self.nerfactor_smooth_use_l1 else nn.MSELoss()
+
         # material part
         self.feats_network = MaterialFeatsNetwork()
         self.metallic_predictor = make_predictor(256+3, 1)
@@ -947,6 +990,200 @@ class MCShadingNetwork(nn.Module):
             raise NotImplementedError
         return geometry
 
+    def _init_nerfactor_embedder(self):
+        # Read configuration values
+        pos_enc = self.nerfactor_config.getboolean('DEFAULT', 'pos_enc')
+        n_freqs_xyz = self.nerfactor_config.getint('DEFAULT', 'n_freqs_xyz')
+        n_freqs_ldir = self.nerfactor_config.getint('DEFAULT', 'n_freqs_ldir')
+        n_freqs_vdir = self.nerfactor_config.getint('DEFAULT', 'n_freqs_vdir')
+
+        # Shortcircuit if not using embedders
+        if not pos_enc:
+            embedder = {
+                'xyz': torch.identity, 'ldir': torch.identity, 'vdir': torch.identity
+            }
+            return embedder
+
+        # Position embedder
+        kwargs = {
+            'incl_input': True,
+            'in_dims': 3,
+            'log2_max_freq': n_freqs_xyz - 1,
+            'n_freqs': n_freqs_xyz,
+            'log_sampling': True,
+            'periodic_func': [torch.sin, torch.cos]
+        }
+        embedder_xyz = nerfactor_Embedder(**kwargs)
+
+        # Light direction embedder
+        kwargs['log2_max_freq'] = n_freqs_ldir - 1
+        kwargs['n_freqs'] = n_freqs_ldir
+        embedder_ldir = nerfactor_Embedder(**kwargs)
+
+        # View direction embedder
+        kwargs['log2_max_freq'] = n_freqs_vdir - 1
+        kwargs['n_freqs'] = n_freqs_vdir
+        embedder_vdir = nerfactor_Embedder(**kwargs)
+
+        # Combine embedders
+        embedder = {
+            'xyz': embedder_xyz, 'ldir': embedder_ldir, 'vdir': embedder_vdir
+        }
+
+        pos_enc = self.nerfactor_config.getboolean('DEFAULT', 'pos_enc')
+        n_freqs_rusink = self.nerfactor_config_brdf.getint('DEFAULT', 'n_freqs')
+
+        if not pos_enc:
+            embedder['rusink'] = lambda x: x  # Identity function
+            return embedder
+
+        # Parameters for the rusink embedder
+        kwargs = {
+            'incl_input': True,
+            'in_dims': 3,
+            'log2_max_freq': n_freqs_rusink - 1,
+            'n_freqs': n_freqs_rusink,
+            'log_sampling': True,
+            'periodic_func': [torch.sin, torch.cos]
+        }
+        embedder_rusink = nerfactor_Embedder(**kwargs)
+        embedder['rusink'] = embedder_rusink
+        return embedder
+
+    def _pred_brdf_at(self, pts):
+        """
+        Predicts a latent BRDF (represented as a “z” code) at the given 3D positions.
+        """
+        mlp_layers = self.nerfactor_net['brdf_z_mlp'].cuda()
+        out_layer = self.nerfactor_net['brdf_z_out'].cuda()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        embedder = self.nerfactor_embedder['xyz']
+        # Scale points appropriately (user is unaware of the scaling)
+        pts_scaled = self.nerfactor_xyz_scale * pts
+
+        def chunk_func(surf):
+            # Embed the input positions, run them through an MLP and then the output layer.
+            surf_embed = embedder(surf)
+            brdf_z = out_layer(mlp_layers(surf_embed))
+            return brdf_z
+
+        # Apply the network in chunks (to avoid memory issues) along the last dimension.
+        brdf_z = chunk_func(pts_scaled)
+        return brdf_z  # Tensor of shape (N, z_dim)
+
+    def _eval_brdf_at(self, pts2l, pts2c, normal, albedo, brdf_prop):
+        """
+        Evaluates the BRDF (as a combination of a Lambertian and a learned specular
+        component) at the given view and light directions.
+
+        Arguments:
+          pts2l: Tensor of shape (N, L, 3) giving directions from each surface point to each light.
+          pts2c: Tensor of shape (N, 3) giving directions from each surface point to the camera.
+          normal: Tensor of shape (N, 3) with world-space normals.
+          albedo: Tensor of shape (N, 3) containing the Lambertian (diffuse) albedo.
+          brdf_prop: Tensor of shape (N, z_dim) (the learned BRDF properties).
+
+        Returns:
+          A tensor of shape (N, L, 3) with the final BRDF evaluated for each ray–light pair.
+        """
+
+        # Get a learned BRDF scaling factor from configuration.
+        brdf_scale = self.nerfactor_config.getfloat('DEFAULT', 'learned_brdf_scale')
+        z = brdf_prop
+
+        # Get the rotation matrices to map world-space normals into a local frame.
+        world2local = geomutil.gen_world2local(normal)  # shape: (N, 3, 3)
+
+        # Transform directions into local frames.
+        # Here we use torch.einsum to mimic TensorFlow’s einsum behavior.
+        # (pts2c: (N, 3); world2local: (N, 3, 3) -> vdir: (N, 3))
+        vdir = torch.einsum('jkl,jl->jk', world2local, pts2c)
+        # (pts2l: (N, L, 3); world2local: (N, 3, 3) -> ldir: (N, L, 3))
+        ldir = torch.einsum('jkl,jnl->jnk', world2local, pts2l)
+
+        # Flatten light directions for per-direction processing.
+        ldir_flat = ldir.reshape(-1, 3)
+        # For the view direction, repeat each ray’s view vector for all L light directions.
+        vdir_rep = vdir.unsqueeze(1).repeat(1, ldir.shape[1], 1)
+        vdir_flat = vdir_rep.reshape(-1, 3)
+
+        # Convert the pair of (local) directions into Rusink coordinates.
+        rusink = geomutil.dir2rusink(ldir_flat, vdir_flat)  # shape: (N*L, 3)
+
+        # Repeat the BRDF “z” property for each light direction.
+        z_rep = z.unsqueeze(1).repeat(1, ldir.shape[1], 1)
+        z_flat = z_rep.reshape(-1, self.nerfactor_z_dim)
+
+        # Mask out back‐lit directions.
+        # Create a local “up” vector. (Ensure it’s on the same device as ldir.)
+        local_normal = torch.tensor([0, 0, 1], dtype=torch.float32, device=ldir.device).reshape(3, 1)
+        # Compute the cosine between each light direction and the local normal.
+        cos = ldir_flat @ local_normal  # shape: (N*L, 1)
+        front_lit = cos.reshape(-1) > 0  # Boolean mask: True for front-lit directions.
+        rusink_fl = rusink[front_lit]
+        z_fl = z_flat[front_lit]
+
+        # Predict the specular (BRDF) response in the Rusink coordinate space.
+        mlp_layers = self.nerfactor_brdf_model.net['brdf_mlp']
+        out_layer = self.nerfactor_brdf_model.net['brdf_out']
+        embedder = self.nerfactor_embedder['rusink']
+
+        def chunk_func(rusink_z):
+            # Split the input into Rusink coordinates and the corresponding BRDF z.
+            rusink_val = rusink_z[:, :3]
+            z_val = rusink_z[:, 3:]
+            # Embed the Rusink coordinates.
+            rusink_embed = embedder(rusink_val)
+            # Concatenate the latent BRDF z and the Rusink embedding.
+            z_rusink = torch.cat((z_val, rusink_embed), dim=1)
+            z_rusink_tf = tf.convert_to_tensor(z_rusink.detach().cpu().numpy(), dtype=tf.float32)
+            # (Optionally, you may check that z_rusink.shape[1] == self.z_dim + embedder.out_dims)
+            brdf = out_layer(mlp_layers(z_rusink_tf))
+            return torch.tensor(brdf.numpy()).cuda()
+
+        # Concatenate the Rusink coordinates and BRDF z values.
+        rusink_z = torch.cat((rusink_fl, z_fl), dim=1)
+        brdf_fl = chunk_func(rusink_z)  # shape: (N_front, 1)
+
+        # Scatter the computed front-lit BRDF values back into a tensor of shape (N*L, 1).
+        # (In PyTorch, boolean indexing can be used to assign into a pre-created tensor.)
+        brdf_flat = torch.zeros((ldir_flat.shape[0], 1), dtype=brdf_fl.dtype, device=ldir_flat.device)
+        brdf_flat[front_lit] = brdf_fl
+
+        # Reshape the flat tensor back into (N, L, 1) and expand to 3 channels (achromatic specular).
+        spec = brdf_flat.reshape(ldir.shape[0], ldir.shape[1], 1)
+        spec = spec.expand(-1, -1, 3)
+
+        # Combine the diffuse (Lambertian) and specular components.
+        # (albedo: (N, 3) → unsqueeze to (N, 1, 3) for broadcasting over L.)
+        brdf = spec * brdf_scale
+        return brdf  # Tensor of shape (N, L, 3)
+
+    def transform_local_to_world(self, normals, local_dirs):
+        """
+        Build an orthonormal basis for each normal and transform local_dirs (BxN x 3) to world space.
+        """
+        # For each normal, compute tangent and bitangent.
+        B = normals.shape[0]
+        device = normals.device
+        # Use a similar technique as before:
+        # Choose an up vector that is not colinear.
+        up = torch.where(torch.abs(normals[:, 2:3]) < 0.999,
+                         torch.tensor([0, 0, 1], dtype=torch.float32, device=device),
+                         torch.tensor([1, 0, 0], dtype=torch.float32, device=device))
+        tangent = torch.nn.functional.normalize(torch.cross(up, normals, dim=1), dim=1)
+        bitangent = torch.cross(normals, tangent, dim=1)
+        # Expand basis vectors for broadcasting with samples.
+        tangent = tangent.unsqueeze(1)  # (B, 1, 3)
+        bitangent = bitangent.unsqueeze(1)
+        normals_exp = normals.unsqueeze(1)
+        # Combine local directions: local_dirs assumed shape (B, num_samples, 3)
+        world_dirs = local_dirs[..., 0:1] * tangent + local_dirs[..., 1:2] * bitangent + local_dirs[...,
+                                                                                         2:3] * normals_exp
+        world_dirs = mathutil.safe_l2_normalize(world_dirs, axis=-1)
+        return world_dirs
+
+
     def shade_mixed(self, pts, normals, view_dirs, reflections, metallic, roughness, albedo, human_poses, is_train):
         F0 = 0.04 * (1 - metallic) + metallic * albedo # [pn,1]
 
@@ -1010,6 +1247,110 @@ class MCShadingNetwork(nn.Module):
         outputs['specular_color'] = specular_colors
         outputs['approximate_light'] = torch.clamp(linear_to_srgb(torch.mean(kd[:,:diffuse_num] * diffuse_lights, dim=1)+specular_colors),min=0,max=1)
         return colors, outputs
+    # def shade_mixed(self, pts, normals, view_dirs, reflections, metallic, roughness, albedo, human_poses, is_train):
+    #
+    #     # sample specular directions
+    #     # specular_directions, spec_pdfs = self.sample_specular_seperate(normals, view_dirs, 30, self.cfg['specular_sample_num'])
+    #     specular_directions, spec_pdfs = self.sample_cosine_weighted_rays(normals, self.cfg['specular_sample_num'])
+    #     specular_num = specular_directions.shape[1]
+    #
+    #     # sample diffuse directions
+    #     # diffuse_directions, diff_pdfs = self.sample_diffuse_seperate(normals, self.cfg['diffuse_sample_num'])  # [pn,sn0,3]
+    #     diff_pdfs = spec_pdfs
+    #     diffuse_directions = specular_directions
+    #     point_num, diffuse_num, _ = diffuse_directions.shape
+    #
+    #     # combine
+    #     # directions = torch.cat([diffuse_directions, specular_directions], 1)
+    #     # sn = diffuse_num + specular_num
+    #     directions = specular_directions
+    #     sn = specular_num
+    #
+    #     # specular
+    #     human_poses = human_poses.unsqueeze(1).repeat(1, sn, 1, 1) if human_poses is not None else None
+    #     pts_ = pts.unsqueeze(1).repeat(1, sn, 1)
+    #     lights, hl, light_pts, light_normals, light_pts_mask = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
+    #     # specular_lights = lights[:, diffuse_num:]
+    #     specular_lights = lights
+    #     # Change here for using /nerfactor BRDF model
+    #
+    #     brdf_prop = self._pred_brdf_at(pts)
+    #     brdf_prop_jitter = None
+    #     if self.nerfactor_normalize_brdf_z:
+    #         brdf_prop = mathutil.safe_l2_normalize(brdf_prop, axis=1)
+    #         if brdf_prop_jitter is not None:
+    #             brdf_prop_jitter = mathutil.safe_l2_normalize(
+    #                 brdf_prop_jitter, axis=1)
+    #     surf2l = mathutil.safe_l2_normalize(specular_directions, axis=-1)
+    #     surf2c = mathutil.safe_l2_normalize(-view_dirs, axis=-1)
+    #     brdf_normals = mathutil.safe_l2_normalize(normals, axis=-1)
+    #     albedo_nerfacor = albedo * 0.77 + 0.03
+    #     spec_brdf = self._eval_brdf_at(
+    #         surf2l, surf2c, brdf_normals, albedo_nerfacor, brdf_prop)  # NxLx3
+    #
+    #     cos_theta_spec = torch.clamp(
+    #         (specular_directions * brdf_normals.unsqueeze(1)).sum(dim=-1), min=0.0)  # (B, n_samples)
+    #     # cos_theta_diff = torch.clamp(
+    #     #     (diffuse_directions * brdf_normals.unsqueeze(1)).sum(dim=-1), min=0.0)  # (B, n_samples)
+    #     cos_theta_diff = cos_theta_spec
+    #
+    #     cos_theta_spec = cos_theta_spec.unsqueeze(-1)
+    #     cos_theta_diff = cos_theta_diff.unsqueeze(-1)
+    #     spec_pdfs = spec_pdfs.unsqueeze(-1)
+    #     diff_pdfs = diff_pdfs.unsqueeze(-1)
+    #
+    #     if torch.isnan(specular_directions).any():
+    #         print('nan in specular_directions')
+    #     if torch.isinf(specular_directions).any():
+    #         print('inf in specular_directions')
+    #
+    #     if torch.isnan(spec_brdf).any():
+    #         print('nan in spec_brdf')
+    #     if torch.isinf(spec_brdf).any():
+    #         print('inf in spec_brdf')
+    #
+    #     if torch.isnan(specular_lights).any():
+    #         print('nan in specular_lights')
+    #     if torch.isinf(specular_lights).any():
+    #         print('inf in specular_lights')
+    #
+    #     if torch.isnan(cos_theta_spec).any():
+    #         print('nan in cos_theta')
+    #     if torch.isinf(cos_theta_spec).any():
+    #         print('inf in cos_theta')
+    #
+    #     if torch.isnan(spec_pdfs).any():
+    #         print('nan in pdfs')
+    #     if torch.isinf(spec_pdfs).any():
+    #         print('inf in pdfs')
+    #
+    #     specular_colors = torch.mean(spec_brdf * specular_lights * cos_theta_spec / (0.001 + spec_pdfs), 1)
+    #     spec_brdf_avg = torch.mean(spec_brdf, 1)
+    #
+    #     # diffuse_lights = lights[:, :diffuse_num]
+    #     diffuse_lights = lights
+    #     #
+    #
+    #     diffuse_colors = torch.mean(albedo_nerfacor.unsqueeze(1) / np.pi * diffuse_lights * cos_theta_diff / (0.001+diff_pdfs), 1)
+    #
+    #     colors = diffuse_colors + specular_colors
+    #     colors = torch.clamp(colors, min=0.0, max=1.0)
+    #     colors = linear_to_srgb(colors)
+    #
+    #     outputs = {}
+    #     outputs['albedo'] = albedo
+    #     outputs['spec_brdf'] = spec_brdf
+    #
+    #     outputs['human_lights'] = hl.reshape(-1, 3)
+    #     outputs['diffuse_light'] = torch.clamp(linear_to_srgb(torch.mean(diffuse_lights, dim=1)), min=0, max=1)
+    #     outputs['specular_light'] = torch.clamp(linear_to_srgb(torch.mean(specular_lights, dim=1)), min=0, max=1)
+    #     diffuse_colors = torch.clamp(linear_to_srgb(diffuse_colors), min=0, max=1)
+    #     specular_colors = torch.clamp(linear_to_srgb(specular_colors), min=0, max=1)
+    #     outputs['diffuse_color'] = diffuse_colors
+    #     outputs['specular_color'] = specular_colors
+    #     outputs['spec_brdf'] = spec_brdf_avg
+    #
+    #     return colors, outputs
 
     def forward(self, pts, view_dirs, normals, human_poses, step, is_train):
         view_dirs, normals = F.normalize(view_dirs, dim=-1), F.normalize(normals, dim=-1)
