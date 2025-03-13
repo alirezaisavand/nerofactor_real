@@ -1194,173 +1194,173 @@ class MCShadingNetwork(nn.Module):
         return world_dirs
 
 
-    def shade_mixed(self, pts, normals, view_dirs, reflections, metallic, roughness, albedo, human_poses, is_train):
-        F0 = 0.04 * (1 - metallic) + metallic * albedo # [pn,1]
-
-        # sample diffuse directions
-        diffuse_directions = self.sample_diffuse_directions(normals, is_train)  # [pn,sn0,3]
-        point_num, diffuse_num, _ = diffuse_directions.shape
-        # sample specular directions
-        specular_directions = self.sample_specular_directions(reflections, roughness, is_train) # [pn,sn1,3]
-        specular_num = specular_directions.shape[1]
-
-        # diffuse sample prob
-        NoL_d = saturate_dot(diffuse_directions, normals.unsqueeze(1))
-        diffuse_probability = NoL_d / np.pi * (diffuse_num / (specular_num+diffuse_num))
-
-        # specualr sample prob
-        H_s = (view_dirs.unsqueeze(1) + specular_directions) # [pn,sn0,3]
-        H_s = F.normalize(H_s, dim=-1)
-        NoH_s = saturate_dot(normals.unsqueeze(1), H_s)
-        VoH_s = saturate_dot(view_dirs.unsqueeze(1),H_s)
-        specular_probability = self.distribution_ggx(NoH_s, roughness.unsqueeze(1)) * NoH_s / (4 * VoH_s + 1e-5) * (specular_num / (specular_num+diffuse_num)) # D * NoH / (4 * VoH)
-
-        # combine
-        directions = torch.cat([diffuse_directions, specular_directions], 1)
-        probability = torch.cat([diffuse_probability, specular_probability], 1)
-        sn = diffuse_num+specular_num
-
-        # specular
-        fresnel, H, HoV = self.fresnel_schlick_directions(F0.unsqueeze(1), view_dirs.unsqueeze(1), directions)
-        NoV = saturate_dot(normals, view_dirs).unsqueeze(1) # pn,1,3
-        NoL = saturate_dot(normals.unsqueeze(1), directions) # pn,sn,3
-        geometry = self.geometry(NoV, NoL, roughness.unsqueeze(1))
-        NoH = saturate_dot(normals.unsqueeze(1), H)
-        distribution = self.distribution_ggx(NoH, roughness.unsqueeze(1))
-        human_poses = human_poses.unsqueeze(1).repeat(1, sn, 1, 1) if human_poses is not None else None
-        pts_ = pts.unsqueeze(1).repeat(1, sn, 1)
-        lights, hl, light_pts, light_normals, light_pts_mask = self.get_lights(pts_, directions, human_poses) # pn,sn,3
-        specular_weights = distribution * geometry / (4 * NoV * probability + 1e-5)
-        specular_lights =  lights * specular_weights
-        specular_colors = torch.mean(fresnel * specular_lights, 1)
-        specular_weights = specular_weights * fresnel
-
-        # diffuse only consider diffuse directions
-        kd = (1 - metallic.unsqueeze(1))
-        diffuse_lights = lights[:,:diffuse_num]
-        diffuse_colors = albedo.unsqueeze(1) * kd[:,:diffuse_num] * diffuse_lights
-        diffuse_colors = torch.mean(diffuse_colors, 1)
-
-        colors = diffuse_colors + specular_colors
-        colors = linear_to_srgb(colors)
-
-        outputs={}
-        outputs['albedo'] = albedo
-        outputs['roughness'] = roughness
-        outputs['metallic'] = metallic
-        outputs['human_lights'] = hl.reshape(-1,3)
-        outputs['diffuse_light'] = torch.clamp(linear_to_srgb(torch.mean(diffuse_lights, dim=1)),min=0,max=1)
-        outputs['specular_light'] = torch.clamp(linear_to_srgb(torch.mean(specular_lights, dim=1)),min=0,max=1)
-        diffuse_colors = torch.clamp(linear_to_srgb(diffuse_colors),min=0,max=1)
-        specular_colors = torch.clamp(linear_to_srgb(specular_colors),min=0,max=1)
-        outputs['diffuse_color'] = diffuse_colors
-        outputs['specular_color'] = specular_colors
-        outputs['approximate_light'] = torch.clamp(linear_to_srgb(torch.mean(kd[:,:diffuse_num] * diffuse_lights, dim=1)+specular_colors),min=0,max=1)
-        return colors, outputs
     # def shade_mixed(self, pts, normals, view_dirs, reflections, metallic, roughness, albedo, human_poses, is_train):
-    #
-    #     # sample specular directions
-    #     # specular_directions, spec_pdfs = self.sample_specular_seperate(normals, view_dirs, 30, self.cfg['specular_sample_num'])
-    #     specular_directions, spec_pdfs = self.sample_cosine_weighted_rays(normals, self.cfg['specular_sample_num'])
-    #     specular_num = specular_directions.shape[1]
+    #     F0 = 0.04 * (1 - metallic) + metallic * albedo # [pn,1]
     #
     #     # sample diffuse directions
-    #     # diffuse_directions, diff_pdfs = self.sample_diffuse_seperate(normals, self.cfg['diffuse_sample_num'])  # [pn,sn0,3]
-    #     diff_pdfs = spec_pdfs
-    #     diffuse_directions = specular_directions
+    #     diffuse_directions = self.sample_diffuse_directions(normals, is_train)  # [pn,sn0,3]
     #     point_num, diffuse_num, _ = diffuse_directions.shape
+    #     # sample specular directions
+    #     specular_directions = self.sample_specular_directions(reflections, roughness, is_train) # [pn,sn1,3]
+    #     specular_num = specular_directions.shape[1]
+    #
+    #     # diffuse sample prob
+    #     NoL_d = saturate_dot(diffuse_directions, normals.unsqueeze(1))
+    #     diffuse_probability = NoL_d / np.pi * (diffuse_num / (specular_num+diffuse_num))
+    #
+    #     # specualr sample prob
+    #     H_s = (view_dirs.unsqueeze(1) + specular_directions) # [pn,sn0,3]
+    #     H_s = F.normalize(H_s, dim=-1)
+    #     NoH_s = saturate_dot(normals.unsqueeze(1), H_s)
+    #     VoH_s = saturate_dot(view_dirs.unsqueeze(1),H_s)
+    #     specular_probability = self.distribution_ggx(NoH_s, roughness.unsqueeze(1)) * NoH_s / (4 * VoH_s + 1e-5) * (specular_num / (specular_num+diffuse_num)) # D * NoH / (4 * VoH)
     #
     #     # combine
-    #     # directions = torch.cat([diffuse_directions, specular_directions], 1)
-    #     # sn = diffuse_num + specular_num
-    #     directions = specular_directions
-    #     sn = specular_num
+    #     directions = torch.cat([diffuse_directions, specular_directions], 1)
+    #     probability = torch.cat([diffuse_probability, specular_probability], 1)
+    #     sn = diffuse_num+specular_num
     #
     #     # specular
+    #     fresnel, H, HoV = self.fresnel_schlick_directions(F0.unsqueeze(1), view_dirs.unsqueeze(1), directions)
+    #     NoV = saturate_dot(normals, view_dirs).unsqueeze(1) # pn,1,3
+    #     NoL = saturate_dot(normals.unsqueeze(1), directions) # pn,sn,3
+    #     geometry = self.geometry(NoV, NoL, roughness.unsqueeze(1))
+    #     NoH = saturate_dot(normals.unsqueeze(1), H)
+    #     distribution = self.distribution_ggx(NoH, roughness.unsqueeze(1))
     #     human_poses = human_poses.unsqueeze(1).repeat(1, sn, 1, 1) if human_poses is not None else None
     #     pts_ = pts.unsqueeze(1).repeat(1, sn, 1)
-    #     lights, hl, light_pts, light_normals, light_pts_mask = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
-    #     # specular_lights = lights[:, diffuse_num:]
-    #     specular_lights = lights
-    #     # Change here for using /nerfactor BRDF model
+    #     lights, hl, light_pts, light_normals, light_pts_mask = self.get_lights(pts_, directions, human_poses) # pn,sn,3
+    #     specular_weights = distribution * geometry / (4 * NoV * probability + 1e-5)
+    #     specular_lights =  lights * specular_weights
+    #     specular_colors = torch.mean(fresnel * specular_lights, 1)
+    #     specular_weights = specular_weights * fresnel
     #
-    #     brdf_prop = self._pred_brdf_at(pts)
-    #     brdf_prop_jitter = None
-    #     if self.nerfactor_normalize_brdf_z:
-    #         brdf_prop = mathutil.safe_l2_normalize(brdf_prop, axis=1)
-    #         if brdf_prop_jitter is not None:
-    #             brdf_prop_jitter = mathutil.safe_l2_normalize(
-    #                 brdf_prop_jitter, axis=1)
-    #     surf2l = mathutil.safe_l2_normalize(specular_directions, axis=-1)
-    #     surf2c = mathutil.safe_l2_normalize(-view_dirs, axis=-1)
-    #     brdf_normals = mathutil.safe_l2_normalize(normals, axis=-1)
-    #     albedo_nerfacor = albedo * 0.77 + 0.03
-    #     spec_brdf = self._eval_brdf_at(
-    #         surf2l, surf2c, brdf_normals, albedo_nerfacor, brdf_prop)  # NxLx3
-    #
-    #     cos_theta_spec = torch.clamp(
-    #         (specular_directions * brdf_normals.unsqueeze(1)).sum(dim=-1), min=0.0)  # (B, n_samples)
-    #     # cos_theta_diff = torch.clamp(
-    #     #     (diffuse_directions * brdf_normals.unsqueeze(1)).sum(dim=-1), min=0.0)  # (B, n_samples)
-    #     cos_theta_diff = cos_theta_spec
-    #
-    #     cos_theta_spec = cos_theta_spec.unsqueeze(-1)
-    #     cos_theta_diff = cos_theta_diff.unsqueeze(-1)
-    #     spec_pdfs = spec_pdfs.unsqueeze(-1)
-    #     diff_pdfs = diff_pdfs.unsqueeze(-1)
-    #
-    #     if torch.isnan(specular_directions).any():
-    #         print('nan in specular_directions')
-    #     if torch.isinf(specular_directions).any():
-    #         print('inf in specular_directions')
-    #
-    #     if torch.isnan(spec_brdf).any():
-    #         print('nan in spec_brdf')
-    #     if torch.isinf(spec_brdf).any():
-    #         print('inf in spec_brdf')
-    #
-    #     if torch.isnan(specular_lights).any():
-    #         print('nan in specular_lights')
-    #     if torch.isinf(specular_lights).any():
-    #         print('inf in specular_lights')
-    #
-    #     if torch.isnan(cos_theta_spec).any():
-    #         print('nan in cos_theta')
-    #     if torch.isinf(cos_theta_spec).any():
-    #         print('inf in cos_theta')
-    #
-    #     if torch.isnan(spec_pdfs).any():
-    #         print('nan in pdfs')
-    #     if torch.isinf(spec_pdfs).any():
-    #         print('inf in pdfs')
-    #
-    #     specular_colors = torch.mean(spec_brdf * specular_lights * cos_theta_spec / (0.001 + spec_pdfs), 1)
-    #     spec_brdf_avg = torch.mean(spec_brdf, 1)
-    #
-    #     # diffuse_lights = lights[:, :diffuse_num]
-    #     diffuse_lights = lights
-    #     #
-    #
-    #     diffuse_colors = torch.mean(albedo_nerfacor.unsqueeze(1) / np.pi * diffuse_lights * cos_theta_diff / (0.001+diff_pdfs), 1)
+    #     # diffuse only consider diffuse directions
+    #     kd = (1 - metallic.unsqueeze(1))
+    #     diffuse_lights = lights[:,:diffuse_num]
+    #     diffuse_colors = albedo.unsqueeze(1) * kd[:,:diffuse_num] * diffuse_lights
+    #     diffuse_colors = torch.mean(diffuse_colors, 1)
     #
     #     colors = diffuse_colors + specular_colors
-    #     colors = torch.clamp(colors, min=0.0, max=1.0)
     #     colors = linear_to_srgb(colors)
     #
-    #     outputs = {}
+    #     outputs={}
     #     outputs['albedo'] = albedo
-    #     outputs['spec_brdf'] = spec_brdf
-    #
-    #     outputs['human_lights'] = hl.reshape(-1, 3)
-    #     outputs['diffuse_light'] = torch.clamp(linear_to_srgb(torch.mean(diffuse_lights, dim=1)), min=0, max=1)
-    #     outputs['specular_light'] = torch.clamp(linear_to_srgb(torch.mean(specular_lights, dim=1)), min=0, max=1)
-    #     diffuse_colors = torch.clamp(linear_to_srgb(diffuse_colors), min=0, max=1)
-    #     specular_colors = torch.clamp(linear_to_srgb(specular_colors), min=0, max=1)
+    #     outputs['roughness'] = roughness
+    #     outputs['metallic'] = metallic
+    #     outputs['human_lights'] = hl.reshape(-1,3)
+    #     outputs['diffuse_light'] = torch.clamp(linear_to_srgb(torch.mean(diffuse_lights, dim=1)),min=0,max=1)
+    #     outputs['specular_light'] = torch.clamp(linear_to_srgb(torch.mean(specular_lights, dim=1)),min=0,max=1)
+    #     diffuse_colors = torch.clamp(linear_to_srgb(diffuse_colors),min=0,max=1)
+    #     specular_colors = torch.clamp(linear_to_srgb(specular_colors),min=0,max=1)
     #     outputs['diffuse_color'] = diffuse_colors
     #     outputs['specular_color'] = specular_colors
-    #     outputs['spec_brdf'] = spec_brdf_avg
-    #
+    #     outputs['approximate_light'] = torch.clamp(linear_to_srgb(torch.mean(kd[:,:diffuse_num] * diffuse_lights, dim=1)+specular_colors),min=0,max=1)
     #     return colors, outputs
+    def shade_mixed(self, pts, normals, view_dirs, reflections, metallic, roughness, albedo, human_poses, is_train):
+
+        # sample specular directions
+        # specular_directions, spec_pdfs = self.sample_specular_seperate(normals, view_dirs, 30, self.cfg['specular_sample_num'])
+        specular_directions, spec_pdfs = self.sample_cosine_weighted_rays(normals, self.cfg['specular_sample_num'])
+        specular_num = specular_directions.shape[1]
+
+        # sample diffuse directions
+        # diffuse_directions, diff_pdfs = self.sample_diffuse_seperate(normals, self.cfg['diffuse_sample_num'])  # [pn,sn0,3]
+        diff_pdfs = spec_pdfs
+        diffuse_directions = specular_directions
+        point_num, diffuse_num, _ = diffuse_directions.shape
+
+        # combine
+        # directions = torch.cat([diffuse_directions, specular_directions], 1)
+        # sn = diffuse_num + specular_num
+        directions = specular_directions
+        sn = specular_num
+
+        # specular
+        human_poses = human_poses.unsqueeze(1).repeat(1, sn, 1, 1) if human_poses is not None else None
+        pts_ = pts.unsqueeze(1).repeat(1, sn, 1)
+        lights, hl, light_pts, light_normals, light_pts_mask = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
+        # specular_lights = lights[:, diffuse_num:]
+        specular_lights = lights
+        # Change here for using /nerfactor BRDF model
+
+        brdf_prop = self._pred_brdf_at(pts)
+        brdf_prop_jitter = None
+        if self.nerfactor_normalize_brdf_z:
+            brdf_prop = mathutil.safe_l2_normalize(brdf_prop, axis=1)
+            if brdf_prop_jitter is not None:
+                brdf_prop_jitter = mathutil.safe_l2_normalize(
+                    brdf_prop_jitter, axis=1)
+        surf2l = mathutil.safe_l2_normalize(specular_directions, axis=-1)
+        surf2c = mathutil.safe_l2_normalize(-view_dirs, axis=-1)
+        brdf_normals = mathutil.safe_l2_normalize(normals, axis=-1)
+        albedo_nerfacor = albedo * 0.77 + 0.03
+        spec_brdf = self._eval_brdf_at(
+            surf2l, surf2c, brdf_normals, albedo_nerfacor, brdf_prop)  # NxLx3
+
+        cos_theta_spec = torch.clamp(
+            (specular_directions * brdf_normals.unsqueeze(1)).sum(dim=-1), min=0.0)  # (B, n_samples)
+        # cos_theta_diff = torch.clamp(
+        #     (diffuse_directions * brdf_normals.unsqueeze(1)).sum(dim=-1), min=0.0)  # (B, n_samples)
+        cos_theta_diff = cos_theta_spec
+
+        cos_theta_spec = cos_theta_spec.unsqueeze(-1)
+        cos_theta_diff = cos_theta_diff.unsqueeze(-1)
+        spec_pdfs = spec_pdfs.unsqueeze(-1)
+        diff_pdfs = diff_pdfs.unsqueeze(-1)
+
+        if torch.isnan(specular_directions).any():
+            print('nan in specular_directions')
+        if torch.isinf(specular_directions).any():
+            print('inf in specular_directions')
+
+        if torch.isnan(spec_brdf).any():
+            print('nan in spec_brdf')
+        if torch.isinf(spec_brdf).any():
+            print('inf in spec_brdf')
+
+        if torch.isnan(specular_lights).any():
+            print('nan in specular_lights')
+        if torch.isinf(specular_lights).any():
+            print('inf in specular_lights')
+
+        if torch.isnan(cos_theta_spec).any():
+            print('nan in cos_theta')
+        if torch.isinf(cos_theta_spec).any():
+            print('inf in cos_theta')
+
+        if torch.isnan(spec_pdfs).any():
+            print('nan in pdfs')
+        if torch.isinf(spec_pdfs).any():
+            print('inf in pdfs')
+
+        specular_colors = torch.mean(spec_brdf * specular_lights * cos_theta_spec / (0.001 + spec_pdfs), 1)
+        spec_brdf_avg = torch.mean(spec_brdf, 1)
+
+        # diffuse_lights = lights[:, :diffuse_num]
+        diffuse_lights = lights
+        #
+
+        diffuse_colors = torch.mean(albedo_nerfacor.unsqueeze(1) / np.pi * diffuse_lights * cos_theta_diff / (0.001+diff_pdfs), 1)
+
+        colors = diffuse_colors + specular_colors
+        colors = torch.clamp(colors, min=0.0, max=1.0)
+        colors = linear_to_srgb(colors)
+
+        outputs = {}
+        outputs['albedo'] = albedo
+        outputs['spec_brdf'] = spec_brdf
+
+        outputs['human_lights'] = hl.reshape(-1, 3)
+        outputs['diffuse_light'] = torch.clamp(linear_to_srgb(torch.mean(diffuse_lights, dim=1)), min=0, max=1)
+        outputs['specular_light'] = torch.clamp(linear_to_srgb(torch.mean(specular_lights, dim=1)), min=0, max=1)
+        diffuse_colors = torch.clamp(linear_to_srgb(diffuse_colors), min=0, max=1)
+        specular_colors = torch.clamp(linear_to_srgb(specular_colors), min=0, max=1)
+        outputs['diffuse_color'] = diffuse_colors
+        outputs['specular_color'] = specular_colors
+        outputs['spec_brdf'] = spec_brdf_avg
+
+        return colors, outputs
 
     def forward(self, pts, view_dirs, normals, human_poses, step, is_train):
         view_dirs, normals = F.normalize(view_dirs, dim=-1), F.normalize(normals, dim=-1)
