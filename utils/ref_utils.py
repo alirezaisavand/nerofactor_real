@@ -98,10 +98,10 @@ def generate_ide_fn(deg_view):
         z = xyz[..., 2:3]
 
         # Compute z Vandermonde matrix.
-        vmz = torch.concat([z**i for i in range(mat.shape[0])], dim=-1)
+        vmz = torch.cat([z**i for i in range(mat.shape[0])], dim=-1)
 
         # Compute x+iy Vandermonde matrix.
-        vmxy = torch.concat([(x + 1j * y)**m for m in ml_array[0, :]], dim=-1)
+        vmxy = torch.cat([(x + 1j * y)**m for m in ml_array[0, :]], dim=-1)
 
         # Get spherical harmonics.
         sph_harms = vmxy * torch.matmul(vmz, mat)
@@ -112,7 +112,7 @@ def generate_ide_fn(deg_view):
         ide = sph_harms * torch.exp(-sigma * kappa_inv)
 
         # Split into real and imaginary parts and return
-        return torch.concat([torch.real(ide), torch.imag(ide)], dim=-1)
+        return torch.cat([torch.real(ide), torch.imag(ide)], dim=-1)
 
     return integrated_dir_enc_fn
 
